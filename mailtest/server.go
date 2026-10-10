@@ -1,6 +1,11 @@
-// Package mailtest is an in-process SMTP server for tests of internal/mail
-// and its users: plain, STARTTLS or implicit TLS, optional AUTH PLAIN, and
+// Package mailtest is an in-process SMTP server for tests of onemailer
+// and the code that uses it: plain, STARTTLS or implicit TLS, optional AUTH PLAIN, and
 // scripted failures. It listens on 127.0.0.1 only.
+//
+//	srv := mailtest.Start(t, mailtest.Options{Mode: mailtest.StartTLS})
+//	cfg = cfg.WithRootCAs(srv.Roots) // with SMTP_HOST=srv.Host, SMTP_PORT=srv.PortString()
+//	// … send …
+//	got := srv.Messages()
 package mailtest
 
 import (
@@ -14,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"net/textproto"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,8 +40,11 @@ type Options struct {
 	// CertHost is the name in the certificate; default "localhost" (with the
 	// IP 127.0.0.1). Another name makes verification fail.
 	CertHost string
-	// Username and Password, when set, are required (AUTH PLAIN).
+	// Username and Password, when set, are required.
 	Username, Password string
+	// AuthMechs are the AUTH mechanisms offered: "PLAIN" and/or "LOGIN";
+	// default PLAIN.
+	AuthMechs []string
 	// FailData makes the first FailData DATA commands answer 451.
 	FailData int
 	// RejectRcpt makes RCPT TO answer 550.
@@ -72,6 +81,9 @@ func Start(t testing.TB, opts Options) *Server {
 	t.Helper()
 	if opts.Mode == "" {
 		opts.Mode = Plain
+	}
+	if len(opts.AuthMechs) == 0 {
+		opts.AuthMechs = []string{"PLAIN"}
 	}
 	certHost := opts.CertHost
 	if certHost == "" {
@@ -147,7 +159,7 @@ func (s *Server) session(conn net.Conn) {
 			if s.opts.Mode == StartTLS && !isTLS {
 				lines = append(lines, "STARTTLS")
 			}
-			lines = append(lines, "AUTH PLAIN", "8BITMIME")
+			lines = append(lines, "AUTH "+strings.Join(s.opts.AuthMechs, " "), "8BITMIME")
 			reply(250, lines...)
 		case "HELO":
 			reply(250, "mailtest")
@@ -165,14 +177,38 @@ func (s *Server) session(conn net.Conn) {
 			tp = textproto.NewConn(tc)
 		case "AUTH":
 			mech, initial, _ := strings.Cut(arg, " ")
-			raw, err := base64.StdEncoding.DecodeString(initial)
-			parts := strings.Split(string(raw), "\x00")
-			if !strings.EqualFold(mech, "PLAIN") || err != nil || len(parts) != 3 ||
-				parts[1] != s.opts.Username || parts[2] != s.opts.Password {
+			mech = strings.ToUpper(mech)
+			if !slices.Contains(s.opts.AuthMechs, mech) {
+				reply(504, "mechanism not offered")
+				continue
+			}
+			var user, pass string
+			switch mech {
+			case "PLAIN":
+				raw, err := base64.StdEncoding.DecodeString(initial)
+				if parts := strings.Split(string(raw), "\x00"); err == nil && len(parts) == 3 {
+					user, pass = parts[1], parts[2]
+				}
+			case "LOGIN":
+				ask := func(prompt string) string {
+					reply(334, base64.StdEncoding.EncodeToString([]byte(prompt)))
+					line, _ := tp.ReadLine()
+					raw, _ := base64.StdEncoding.DecodeString(line)
+					return string(raw)
+				}
+				if initial != "" {
+					raw, _ := base64.StdEncoding.DecodeString(initial)
+					user = string(raw)
+				} else {
+					user = ask("Username:")
+				}
+				pass = ask("Password:")
+			}
+			if user == "" || user != s.opts.Username || pass != s.opts.Password {
 				reply(535, "authentication failed")
 				continue
 			}
-			authUser = parts[1]
+			authUser = user
 			reply(235, "ok")
 		case "MAIL":
 			if s.opts.Username != "" && authUser == "" {
