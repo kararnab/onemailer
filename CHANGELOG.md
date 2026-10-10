@@ -7,6 +7,8 @@ version may change the API).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-10
+
 ### Fixed
 - `Queue` no longer retries permanent failures: an invalid message, an SMTP
   5xx reply (`550` unknown recipient, `535` bad login) or a server refused by
@@ -42,5 +44,6 @@ version may change the API).
 - First release: `LoadConfig`, `SMTPSender`, `Message`, `Queue`,
   `Lifetime` and `mailtest`, extracted from CodeAtlas.
 
-[Unreleased]: https://github.com/kararnab/onemailer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kararnab/onemailer/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kararnab/onemailer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kararnab/onemailer/releases/tag/v0.1.0
