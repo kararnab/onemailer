@@ -63,6 +63,14 @@ func (c Config) WithRootCAs(pool *x509.CertPool) Config {
 	return c
 }
 
+// WithPassword returns c with the SMTP password set, for a Config built in
+// code rather than by LoadConfig (flags, a config file, a secret manager).
+// Username must be set too.
+func (c Config) WithPassword(password string) Config {
+	c.password = password
+	return c
+}
+
 // plainAllowed reports whether plain SMTP may go to the configured host.
 func (c Config) plainAllowed() bool {
 	return IsLoopback(c.Host) || (c.AllowPlainHost != "" && strings.EqualFold(c.Host, c.AllowPlainHost))
@@ -91,7 +99,8 @@ func (c Config) GoString() string { return c.String() }
 // named with prefix (for example "LIBRARYZ_"):
 //
 //	{P}MAIL_PROVIDER          none (default) or smtp
-//	{P}PUBLIC_URL             absolute http(s) origin links point at; required with smtp;
+//	{P}PUBLIC_URL             absolute http(s) origin links point at; required with smtp
+//	                          (unless OptionalPublicURL is passed);
 //	                          http only to localhost or when {P}ENV=development
 //	{P}MAIL_FROM              sender, "App <accounts@example.org>"; required with smtp
 //	{P}MAIL_REPLY_TO          optional reply address
@@ -103,7 +112,11 @@ func (c Config) GoString() string { return c.String() }
 //	{P}SMTP_PASSWORD          or {P}SMTP_PASSWORD_FILE (preferred); at most one
 //
 // Every error names its variable; none contains the password.
-func LoadConfig(getenv func(string) string, prefix string) (Config, error) {
+func LoadConfig(getenv func(string) string, prefix string, opts ...LoadOption) (Config, error) {
+	var o loadOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	env := func(name string) string { return getenv(prefix + name) }
 	name := func(n string) string { return prefix + n }
 	development := env("ENV") == "development"
@@ -139,7 +152,7 @@ func LoadConfig(getenv func(string) string, prefix string) (Config, error) {
 		return cfg, nil
 	}
 
-	if cfg.PublicURL == "" {
+	if cfg.PublicURL == "" && !o.optionalPublicURL {
 		return Config{}, fmt.Errorf("%s is required when %s=smtp (the address links point at)", name("PUBLIC_URL"), name("MAIL_PROVIDER"))
 	}
 	from := env("MAIL_FROM")
@@ -212,6 +225,22 @@ func LoadConfig(getenv func(string) string, prefix string) (Config, error) {
 		return Config{}, fmt.Errorf("%s is required with an SMTP password", name("SMTP_USERNAME"))
 	}
 	return cfg, nil
+}
+
+// LoadOption changes what LoadConfig requires.
+type LoadOption func(*loadOptions)
+
+type loadOptions struct {
+	optionalPublicURL bool
+}
+
+// OptionalPublicURL lets {PREFIX}MAIL_PROVIDER=smtp start without
+// {PREFIX}PUBLIC_URL, for a service whose mail carries no links (alerts,
+// receipts). It is still validated when set. Without this option it is
+// required, so a service that does send links cannot start without the
+// origin they point at.
+func OptionalPublicURL() LoadOption {
+	return func(o *loadOptions) { o.optionalPublicURL = true }
 }
 
 // IsLoopback reports whether host is localhost or a loopback IP address.

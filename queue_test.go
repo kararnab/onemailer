@@ -206,3 +206,125 @@ func TestQueue_CloseDropsPendingRetries(t *testing.T) {
 		t.Fatal("accepted after Close")
 	}
 }
+
+// A permanent failure (marked, or an SMTP 5xx) is dropped after one try.
+func TestQueue_DoesNotRetryPermanentFailures(t *testing.T) {
+	for _, err := range []error{
+		Permanent(errors.New("invalid recipient")),
+		&textproto.Error{Code: 550, Msg: "no such user"},
+		&textproto.Error{Code: 535, Msg: "authentication failed"},
+	} {
+		s := &fakeSender{fail: 10, err: err}
+		q, c, logs := newTestQueue(s, 4)
+		q.Enqueue(resetMsg)
+		waitFor(t, func() bool { return strings.Contains(logs.String(), "reason=rejected") })
+		q.Close(context.Background())
+		if _, tries := s.count(); tries != 1 || len(c.delays) != 0 {
+			t.Fatalf("%v: tries %d, retries scheduled %v", err, tries, c.delays)
+		}
+		if out := logs.String(); strings.Contains(out, "_retry") || !strings.Contains(out, "event=password_reset_not_sent") {
+			t.Fatalf("log: %s", out)
+		}
+	}
+}
+
+// With mail off, NewSender's sender drops at once, logged at info as mail_off.
+func TestQueue_MailOff(t *testing.T) {
+	sender, err := NewSender(Config{Provider: ProviderNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, c, logs := newTestQueue(sender, 4)
+	if !q.Enqueue(resetMsg) {
+		t.Fatal("not accepted")
+	}
+	q.Close(context.Background())
+	out := logs.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "event=password_reset_not_sent") ||
+		!strings.Contains(out, "reason=mail_off") || len(c.delays) != 0 {
+		t.Fatalf("log: %s", out)
+	}
+	if strings.Contains(out, "secret-link-body") || strings.Contains(out, "ada@example.com") {
+		t.Fatalf("the log holds the body or the address: %s", out)
+	}
+}
+
+// A second Close waits until the first has drained the queue.
+func TestQueue_ConcurrentCloseWaits(t *testing.T) {
+	s := &fakeSender{block: make(chan struct{})}
+	q, _, _ := newTestQueue(s, 4)
+	q.Enqueue(resetMsg)
+	first := make(chan struct{})
+	go func() { q.Close(context.Background()); close(first) }()
+	waitFor(t, func() bool { q.mu.Lock(); defer q.mu.Unlock(); return q.closed })
+	second := make(chan struct{})
+	go func() { q.Close(context.Background()); close(second) }()
+	select {
+	case <-second:
+		t.Fatal("the second Close returned while a message was still being sent")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(s.block)
+	<-first
+	<-second
+	if sent, _ := s.count(); sent != 1 {
+		t.Fatalf("sent %d", sent)
+	}
+}
+
+// The second Close still honours its own context.
+func TestQueue_SecondCloseHonoursItsContext(t *testing.T) {
+	s := &fakeSender{block: make(chan struct{})}
+	q, _, _ := newTestQueue(s, 4)
+	q.Enqueue(resetMsg)
+	go q.Close(context.Background())
+	waitFor(t, func() bool { q.mu.Lock(); defer q.mu.Unlock(); return q.closed })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	q.Close(ctx) // returns when ctx ends
+	close(s.block)
+}
+
+func TestQueue_EmptyKindIsLoggedAsMail(t *testing.T) {
+	s := &fakeSender{}
+	q, _, logs := newTestQueue(s, 4)
+	q.Enqueue(Message{To: "ada@example.com", Subject: "s", Text: "t"})
+	q.Close(context.Background())
+	if out := logs.String(); !strings.Contains(out, "event=mail_sent") {
+		t.Fatalf("log: %s", out)
+	}
+}
+
+func TestQueue_OnResultAndLen(t *testing.T) {
+	var mu sync.Mutex
+	var got []Result
+	s := &fakeSender{fail: 1, block: make(chan struct{})}
+	c := &clock{}
+	q := NewQueue(s, QueueConfig{Capacity: 4, After: c.after, Logger: slog.New(slog.NewTextHandler(&logBuf{}, nil)),
+		OnResult: func(r Result) { mu.Lock(); got = append(got, r); mu.Unlock() }})
+	q.Enqueue(resetMsg) // taken by the worker, which blocks
+	waitFor(t, func() bool { return q.Len() == 0 })
+	q.Enqueue(resetMsg)
+	if n := q.Len(); n != 1 {
+		t.Fatalf("Len %d", n)
+	}
+	close(s.block)
+	c.fire(t, 0)
+	waitFor(t, func() bool { sent, _ := s.count(); return sent == 2 })
+	q.Close(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	var outcomes []Outcome
+	for _, r := range got {
+		outcomes = append(outcomes, r.Outcome)
+		if r.Kind != "password_reset" || len(r.Attrs) != 1 {
+			t.Fatalf("result %+v", r)
+		}
+	}
+	if len(got) != 3 || got[0].Outcome != OutcomeRetry || SMTPCode(got[0].Err) != 451 {
+		t.Fatalf("outcomes %v", outcomes)
+	}
+	if retried := got[2]; retried.Outcome != OutcomeSent || retried.Attempts != 2 {
+		t.Fatalf("outcomes %v, last %+v", outcomes, retried)
+	}
+}

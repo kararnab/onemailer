@@ -1,5 +1,10 @@
 # OneMailer
 
+[![ci](https://github.com/kararnab/onemailer/actions/workflows/ci.yml/badge.svg)](https://github.com/kararnab/onemailer/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/kararnab/onemailer.svg)](https://pkg.go.dev/github.com/kararnab/onemailer)
+[![Go Report Card](https://goreportcard.com/badge/github.com/kararnab/onemailer)](https://goreportcard.com/report/github.com/kararnab/onemailer)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Transactional email over plain SMTP for Go services: password resets,
 verification links, invites. No provider SDK and no provider-specific code,
 so the same build sends mail through a local catcher on a laptop and through
@@ -10,18 +15,45 @@ configuration differs.
 go get github.com/kararnab/onemailer
 ```
 
-Standard library only. Extracted from CodeAtlas's mail package, where it
-delivers password-reset and invite emails, so that LibraryZ and CodeAtlas
-share one implementation.
+Standard library only; Go 1.22 or later.
+
+## Why OneMailer
+
+Sending a password-reset email looks like ten lines of `net/smtp`, until
+you need to get the details right. OneMailer handles:
+
+- **Safe TLS by default.** Certificates are always verified. Plain SMTP is
+  refused except to loopback or one named development catcher. Credentials
+  are never sent in clear.
+- **No secrets in logs.** Outcomes are logged by message kind and your
+  attributes, never with the body, link or recipient. `Config` never
+  prints the password.
+- **Configuration that fails fast.** A bad setting stops the service at
+  startup with the variable's name, not at the first reset request.
+- **Delivery off the request path.** A bounded queue retries temporary
+  failures (4xx, network) and drops permanent ones (5xx, bad address)
+  straight away.
+- **A test SMTP server** (`mailtest`) with STARTTLS, implicit TLS, AUTH
+  PLAIN/LOGIN and scripted failures, so your tests can cover mail too.
+
+Compared with a provider SDK there is no lock-in: Amazon SES, Postmark,
+SendGrid, Resend, Microsoft 365 or Mailpit is a configuration change.
+Compared with general-purpose mail libraries it is deliberately small,
+covering one recipient per transactional message.
+
+It started as the mail package of CodeAtlas and is shared with LibraryZ.
 
 ## What's in it
 
 | | |
 |---|---|
 | `LoadConfig(getenv, prefix)` | Reads `{PREFIX}MAIL_*` / `{PREFIX}SMTP_*` settings and refuses inconsistent ones, naming the variable. Never prints the password. |
-| `SMTPSender` | Delivers one `Message` with the configured TLS mode. Certificates are always verified; plain SMTP only to loopback or one named catcher host; credentials never sent in clear. |
-| `Message` | Text, optional HTML (then `multipart/alternative`), UTF-8 quoted-printable, `Message-ID`, `Reply-To`. Header values with line breaks are refused. |
-| `Queue` | Delivers off the request path: bounded, one worker, retries after 10 s, 1 min and 5 min, then drops and logs. Logs carry the message kind and your attributes, never the body, link or recipient. |
+| `Config` | Can also be built in code (flags, config file, secret manager), with `WithPassword`; `NewSMTPSender` applies the same defaults and refusals. |
+| `NewSender` | An `SMTPSender` when mail is on; when it is off, a sender that delivers nothing (logged as `reason=mail_off`), so the wiring is the same either way. |
+| `SMTPSender` | Delivers one `Message` with the configured TLS mode and AUTH PLAIN or LOGIN. Certificates are always verified; plain SMTP only to loopback or one named catcher host; credentials never sent in clear. |
+| `Message` | Text, optional HTML (then `multipart/alternative`), extra headers (`List-Unsubscribe`, provider tags), attachments (then `multipart/mixed`), UTF-8 quoted-printable, `Message-ID`, `Reply-To`. Line breaks in headers are refused. |
+| `Queue` | Delivers off the request path: bounded, one worker, retries temporary failures after 10 s, 1 min and 5 min, then drops and logs; permanent failures are not retried. Logs carry the message kind and your attributes, never the body, link or recipient. `OnResult` and `Len` feed metrics. |
+| `IsPermanent`, `Permanent` | Tell a failure worth retrying (4xx, network) from one that is not (5xx, invalid message), for your own job system or `Sender`. |
 | `Lifetime` | Words a link lifetime for email copy ("1 hour", "30 minutes"). |
 | `mailtest` | An in-process SMTP server for tests: plain, STARTTLS or implicit TLS, optional AUTH, scripted failures. |
 
@@ -37,21 +69,50 @@ if err != nil {
 }
 log.Printf("mail: %s", cfg) // "smtp smtp.example.org:587 (starttls, login apikey), from …"
 
-if cfg.Enabled() {
-	sender, _ := onemailer.NewSMTPSender(cfg)
-	q := onemailer.NewQueue(sender, onemailer.QueueConfig{})
-	defer q.Close(context.Background())
-
-	q.Enqueue(onemailer.Message{
-		Kind:    "password_reset", // logged as password_reset_sent / _not_sent
-		To:      "reader@example.org",
-		Subject: "Reset your password",
-		Text:    text,
-		HTML:    html,
-		Attrs:   []slog.Attr{slog.String("user_id", id)}, // never a secret
-	})
+sender, err := onemailer.NewSender(cfg) // delivers nothing when mail is off
+if err != nil {
+	log.Fatalf("mail: %v", err)
 }
+q := onemailer.NewQueue(sender, onemailer.QueueConfig{})
+defer q.Close(shutdownCtx) // delivers what is queued, or gives up when ctx ends
+
+q.Enqueue(onemailer.Message{
+	Kind:    "password_reset", // logged as password_reset_sent / _not_sent
+	To:      "reader@example.org",
+	Subject: "Reset your password",
+	Text:    text,
+	HTML:    html,
+	Attrs:   []slog.Attr{slog.String("user_id", id)}, // never a secret
+})
 ```
+
+Settings that don't come from the environment:
+
+```go
+from, _ := mail.ParseAddress("App <accounts@example.org>")
+cfg := onemailer.Config{
+	Provider: onemailer.ProviderSMTP,
+	From:     from,
+	Host:     "smtp.postmarkapp.com", // port 587 and starttls by default
+	Username: token,
+}.WithPassword(token)
+sender, err := onemailer.NewSMTPSender(cfg) // refuses what LoadConfig would
+```
+
+More on [pkg.go.dev](https://pkg.go.dev/github.com/kararnab/onemailer#pkg-examples).
+
+## Delivery guarantees
+
+`Queue` is **in memory and at most once**. A message is lost if the process
+dies while it is queued or waiting for a retry (up to about 6 minutes), and
+`Close` drops (and logs) what is still pending when its context ends.
+That suits password resets and verification links, where the user can ask
+again. Call `Close` with a timeout from your shutdown handler.
+
+When a message must survive a restart (receipts, invites you record as
+sent), call `Sender.Send` from your own durable job system (an outbox
+table, River, Asynq, SQS, …) and decide whether to retry with
+`onemailer.IsPermanent(err)`.
 
 ## Configuration
 
@@ -60,7 +121,7 @@ Every variable carries your prefix (`LIBRARYZ_`, `CODEATLAS_`, …).
 | Variable | |
 |---|---|
 | `MAIL_PROVIDER` | `none` (default: nothing is sent) or `smtp` |
-| `PUBLIC_URL` | The origin links point at. Required with `smtp`. `https`, or `http` for localhost or with `ENV=development` |
+| `PUBLIC_URL` | The origin links point at. Required with `smtp`, so a service cannot start mailing broken links; pass `onemailer.OptionalPublicURL()` to `LoadConfig` if your mail has no links. `https`, or `http` for localhost or with `ENV=development` |
 | `MAIL_FROM` | A real, named sender: `App <accounts@example.org>`, not `no-reply@` (people reply to reset emails, and filters score `no-reply` lower) |
 | `MAIL_REPLY_TO` | Optional; an inbox someone reads |
 | `SMTP_HOST` | Required with `smtp` |
@@ -103,6 +164,8 @@ Code changes: none.
    | Postmark | `smtp.postmarkapp.com` | 587 `starttls` | server API token |
    | SendGrid | `smtp.sendgrid.net` | 587 `starttls` | `apikey` |
    | Resend | `smtp.resend.com` | 465 `tls` | `resend` |
+   | Microsoft 365 | `smtp.office365.com` | 587 `starttls` | the mailbox (SMTP AUTH enabled for it) |
+   | Google Workspace / Gmail | `smtp.gmail.com` | 587 `starttls` | the address, with an app password |
 
    Add the DNS records the provider gives you: **SPF**, **DKIM**, and
    **DMARC** (start with `p=none` and a report address). Without SPF and
@@ -116,6 +179,11 @@ Code changes: none.
    headers for `spf=pass`, `dkim=pass`, `dmarc=pass`.
 4. **Exercise one real flow** (a password reset) and confirm the logs show
    the kind and no link or token.
+
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md)
+and the [changelog](CHANGELOG.md).
 
 ## License
 

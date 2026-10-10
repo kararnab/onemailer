@@ -151,3 +151,18 @@ func TestConfig_StringHidesPassword(t *testing.T) {
 		t.Fatalf("String: %s", cfg)
 	}
 }
+
+func TestLoadConfig_OptionalPublicURL(t *testing.T) {
+	env := smtpEnv("APP_PUBLIC_URL", "<unset>")
+	if _, err := LoadConfig(envOf(env), "APP_"); err == nil || !strings.Contains(err.Error(), "APP_PUBLIC_URL") {
+		t.Fatalf("want APP_PUBLIC_URL required by default, got %v", err)
+	}
+	cfg, err := LoadConfig(envOf(env), "APP_", OptionalPublicURL())
+	if err != nil || !cfg.Enabled() || cfg.PublicURL != "" {
+		t.Fatalf("%v %v", cfg, err)
+	}
+	// Still validated when set.
+	if _, err := LoadConfig(envOf(smtpEnv("APP_PUBLIC_URL", "ftp://x")), "APP_", OptionalPublicURL()); err == nil {
+		t.Fatal("want an error for a bad APP_PUBLIC_URL")
+	}
+}
